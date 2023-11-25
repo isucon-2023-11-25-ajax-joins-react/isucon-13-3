@@ -106,7 +106,7 @@ module Isupipe
         owner_model = tx.xquery('SELECT * FROM users WHERE id = ?', livestream_model.fetch(:user_id)).first
         owner = fill_user_response(tx, owner_model)
 
-        tags = tx.xquery('SELECT * FROM livestream_tags WHERE livestream_id = ?', livestream_model.fetch(:id)).map do |livestream_tag_model|
+        tags = tx.xquery('SELECT tag_id FROM livestream_tags WHERE livestream_id = ?', livestream_model.fetch(:id)).map do |livestream_tag_model|
           tag_model = tx.xquery('SELECT * FROM tags WHERE id = ?', livestream_tag_model.fetch(:tag_id)).first
           {
             id: tag_model.fetch(:id),
@@ -314,9 +314,13 @@ module Isupipe
           if key_tag_name != ''
             # タグによる取得
             tag_id_list = tx.xquery('SELECT id FROM tags WHERE name = ?', key_tag_name, as: :array).map(&:first)
-            tx.xquery('SELECT * FROM livestream_tags WHERE tag_id IN (?) ORDER BY livestream_id DESC', tag_id_list).map do |key_tagged_livestream|
-              tx.xquery('SELECT * FROM livestreams WHERE id = ?', key_tagged_livestream.fetch(:livestream_id)).first
-            end
+            query = <<~SQL
+              SELECT ls.* FROM livestreams ls
+              JOIN livestream_tags lt ON ls.id = lt.livestream_id
+              WHERE lt.tag_id IN (?)
+              ORDER BY ls.id DESC
+            SQL
+            tx.xquery(query, tag_id_list).to_a
           else
             # 検索条件なし
             query = 'SELECT * FROM livestreams ORDER BY id DESC'
@@ -996,14 +1000,18 @@ module Isupipe
         end
 
         # ランク算出
-        ranking = tx.xquery('SELECT * FROM livestreams').map do |livestream|
-          reactions = tx.xquery('SELECT COUNT(*) FROM livestreams l INNER JOIN reactions r ON l.id = r.livestream_id WHERE l.id = ?', livestream.fetch(:id), as: :array).first[0]
-
-          total_tips = tx.xquery('SELECT IFNULL(SUM(l2.tip), 0) FROM livestreams l INNER JOIN livecomments l2 ON l.id = l2.livestream_id WHERE l.id = ?', livestream.fetch(:id), as: :array).first[0]
-
-          score = reactions + total_tips
-          LivestreamRankingEntry.new(livestream_id: livestream.fetch(:id), score:)
+        ranking = tx.xquery('
+          SELECT
+            l.id,
+            (SELECT COUNT(*) FROM reactions r WHERE r.livestream_id = l.id) as reaction_count,
+            (SELECT IFNULL(SUM(lc.tip), 0) FROM livecomments lc WHERE lc.livestream_id = l.id) as total_tips
+          FROM
+            livestreams l
+        ').map do |livestream|
+          score = livestream.fetch(:reaction_count) + livestream.fetch(:total_tips)
+          LivestreamRankingEntry.new(livestream_id: livestream.fetch(:id), score: score)
         end
+
         ranking.sort_by! { |entry| [entry.score, entry.livestream_id] }
         ridx = ranking.rindex { |entry| entry.livestream_id == livestream_id }
         rank = ranking.size - ridx
